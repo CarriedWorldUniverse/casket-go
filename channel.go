@@ -291,6 +291,13 @@ func (c *Channel) DHPublicKeyBytes() []byte  { return c.dhPubBytes }
 func (c *Channel) DHPublicKeyB64u() string   { return b64uEncode(c.dhPubBytes) }
 func (c *Channel) DHAlg() DhAlgorithm        { return c.dhAlg }
 
+// Sign signs arbitrary bytes with the channel's own Ed25519 key.
+// Use for pre-pairing operations (e.g. self-sig on a pairing half) where
+// no PairedChannel exists yet. Returns the raw 64-byte signature.
+func (c *Channel) Sign(data []byte) ([]byte, error) {
+	return ed25519.Sign(c.sigPriv, data), nil
+}
+
 // MakePairingToken builds a PairingToken to exchange OOB with the peer operator.
 func (c *Channel) MakePairingToken(endpoint string) PairingToken {
 	nonce := make([]byte, 16)
