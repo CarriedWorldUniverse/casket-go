@@ -1,11 +1,11 @@
 package casket_test
 
 // Interop tests: verify that casket-go and casket-ts produce byte-identical
-// pathIds and share the same wire format.
+// pathIds and can encrypt/decrypt across the language boundary.
 //
 // Requires:
 //   - Node.js in PATH
-//   - casket-ts built: C:\src\nexus-cw\casket-ts\dist\esm\channel.js
+//   - casket-ts built: dist/esm/channel.js (run 'npm run build' in casket-ts)
 //
 // Set CASKET_TS_DIST to override the default casket-ts dist path.
 // Set CASKET_FIXTURE_SCRIPT to override the default gen-fixture.mjs path.
@@ -30,22 +30,22 @@ import (
 	casket "github.com/nexus-cw/casket-go"
 )
 
+type interopChannelData struct {
+	Token      casket.PairingToken `json:"token"`
+	SigPubKey  string              `json:"sigPubKey"`
+	DhPubKey   string              `json:"dhPubKey"`
+	DhPrivKeyRaw string            `json:"dhPrivKeyRaw"` // base64url raw DH private scalar
+}
+
 type interopFixture struct {
-	Alg      string `json:"alg"`
-	ChannelA struct {
-		Token     casket.PairingToken `json:"token"`
-		SigPubKey string              `json:"sigPubKey"`
-		DhPubKey  string              `json:"dhPubKey"`
-	} `json:"channelA"`
-	ChannelB struct {
-		Token     casket.PairingToken `json:"token"`
-		SigPubKey string              `json:"sigPubKey"`
-		DhPubKey  string              `json:"dhPubKey"`
-	} `json:"channelB"`
-	ExpectedPathID string `json:"expectedPathId"`
-	EncryptedByA   string `json:"encryptedByA"` // base64url nonce||ct+tag from TS channelA
-	AAD            string `json:"aad"`           // base64url raw AAD bytes
-	Plaintext      string `json:"plaintext"`
+	Alg            string             `json:"alg"`
+	ChannelA       interopChannelData `json:"channelA"`
+	ChannelB       interopChannelData `json:"channelB"`
+	ExpectedPathID string             `json:"expectedPathId"`
+	EncryptedByA   string             `json:"encryptedByA"` // TS A encrypted → B (Go) must decrypt
+	EncryptedByB   string             `json:"encryptedByB"` // TS B encrypted → A (Go) must decrypt
+	AAD            string             `json:"aad"`          // base64url raw AAD bytes
+	Plaintext      string             `json:"plaintext"`
 }
 
 func defaultCasketTsDist() string {
@@ -78,7 +78,7 @@ func generateFixture(t *testing.T, alg string) *interopFixture {
 	distPath := defaultCasketTsDist()
 
 	if _, err := os.Stat(distPath); errors.Is(err, os.ErrNotExist) {
-		t.Skipf("casket-ts dist not found at %s — run 'npm run build' in casket-ts first", distPath)
+		t.Skipf("casket-ts dist not found at %s — run 'npm run build' in casket-ts", distPath)
 	}
 
 	cmd := exec.Command(nodeCmd, scriptPath, distPath, alg)
@@ -90,13 +90,13 @@ func generateFixture(t *testing.T, alg string) *interopFixture {
 
 	var fix interopFixture
 	if err := json.Unmarshal(out, &fix); err != nil {
-		t.Fatalf("unmarshalling fixture JSON: %v", err)
+		t.Fatalf("unmarshalling fixture JSON: %v\noutput: %s", err, out)
 	}
 	return &fix
 }
 
-// pathIDFromB64u replicates the pathId formula from channel.go using
-// only raw bytes — verifies the formula independently of the implementation.
+// pathIDFromB64u replicates the pathId formula from channel.go using only raw
+// bytes — verifies the formula independently of the package implementation.
 func pathIDFromB64u(t *testing.T, pubAB64u, pubBB64u string) string {
 	t.Helper()
 	pubA, err := base64.RawURLEncoding.DecodeString(pubAB64u)
@@ -123,79 +123,125 @@ func pathIDFromB64u(t *testing.T, pubAB64u, pubBB64u string) string {
 	return "nxc_" + base64.RawURLEncoding.EncodeToString(digest[:])
 }
 
+func b64uDecode(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		t.Fatalf("base64url decode of %q: %v", s, err)
+	}
+	return b
+}
+
 func runInteropTest(t *testing.T, alg casket.DhAlgorithm) {
 	t.Helper()
 
 	fix := generateFixture(t, string(alg))
 	ctx := context.Background()
 
-	// 1. Verify Go independently computes the same pathId from the TS pubkeys.
+	aadBytes := b64uDecode(t, fix.AAD)
+	expectedPlaintext := fix.Plaintext
+
+	// --- 1. pathId formula verification ---
+	// Go independently computes the same pathId from the TS pubkeys.
 	goPathID := pathIDFromB64u(t, fix.ChannelA.SigPubKey, fix.ChannelB.SigPubKey)
 	if goPathID != fix.ExpectedPathID {
-		t.Errorf("Go pathId formula mismatch:\n  got:  %s\n  want: %s", goPathID, fix.ExpectedPathID)
+		t.Errorf("pathId formula mismatch:\n  got:  %s\n  want: %s", goPathID, fix.ExpectedPathID)
 	}
 
-	// 2. Create a fresh Go channel (nexus-go-b) and pair it with TS channelA's token.
-	//    This exercises the full ECDH + HKDF + AES-GCM path against TS keys.
-	goCh, err := casket.Load(ctx, "nexus-go-b", newMemStorage(), alg)
+	// --- 2. TS encrypts → Go decrypts (full cross-language decrypt) ---
+	// Reconstruct the TS channel B's paired state using fixture private keys.
+	// "Go acting as B" uses B's DH private key + A's DH public key.
+	goAsB, err := casket.PairedChannelFromRawKeys(
+		"nexus-ts-b",
+		nil, // sig priv not needed for decrypt
+		b64uDecode(t, fix.ChannelB.DhPrivKeyRaw),
+		b64uDecode(t, fix.ChannelB.SigPubKey),
+		b64uDecode(t, fix.ChannelA.DhPubKey), // peer DH pub = A's DH pub
+		alg,
+		fix.ExpectedPathID,
+		"nexus-ts-a",
+	)
+	if err != nil {
+		t.Fatalf("PairedChannelFromRawKeys (Go as B): %v", err)
+	}
+
+	encByABytes := b64uDecode(t, fix.EncryptedByA)
+	decByGoB, err := goAsB.DecryptBody(encByABytes, aadBytes)
+	if err != nil {
+		t.Fatalf("TS-A-encrypted → Go-as-B DecryptBody: %v", err)
+	}
+	if string(decByGoB) != expectedPlaintext {
+		t.Errorf("TS→Go decrypt mismatch:\n  got:  %q\n  want: %q", decByGoB, expectedPlaintext)
+	}
+
+	// "Go acting as A" uses A's DH private key + B's DH public key.
+	goAsA, err := casket.PairedChannelFromRawKeys(
+		"nexus-ts-a",
+		nil,
+		b64uDecode(t, fix.ChannelA.DhPrivKeyRaw),
+		b64uDecode(t, fix.ChannelA.SigPubKey),
+		b64uDecode(t, fix.ChannelB.DhPubKey),
+		alg,
+		fix.ExpectedPathID,
+		"nexus-ts-b",
+	)
+	if err != nil {
+		t.Fatalf("PairedChannelFromRawKeys (Go as A): %v", err)
+	}
+
+	encByBBytes := b64uDecode(t, fix.EncryptedByB)
+	decByGoA, err := goAsA.DecryptBody(encByBBytes, aadBytes)
+	if err != nil {
+		t.Fatalf("TS-B-encrypted → Go-as-A DecryptBody: %v", err)
+	}
+	if string(decByGoA) != expectedPlaintext {
+		t.Errorf("TS→Go decrypt mismatch (B→A):\n  got:  %q\n  want: %q", decByGoA, expectedPlaintext)
+	}
+
+	// --- 3. Go encrypts → Go decrypts (using keys derived from TS material) ---
+	goReCT, err := goAsB.EncryptBody([]byte("reply from Go"), aadBytes)
+	if err != nil {
+		t.Fatalf("Go re-encrypt: %v", err)
+	}
+	// The symmetric shared key is the same on both sides — goAsA can decrypt what goAsB encrypted.
+	goReDec, err := goAsA.DecryptBody(goReCT, aadBytes)
+	if err != nil {
+		t.Fatalf("Go re-decrypt: %v", err)
+	}
+	if string(goReDec) != "reply from Go" {
+		t.Errorf("Go re-decrypt: got %q, want %q", goReDec, "reply from Go")
+	}
+
+	// --- 4. Pair a fresh Go channel with TS token and verify pathId ---
+	goCh, err := casket.Load(ctx, "nexus-go-peer", newMemStorage(), alg)
 	if err != nil {
 		t.Fatalf("casket.Load: %v", err)
 	}
-
-	// Use a refreshed ts so Pair() doesn't reject the fixture token as stale.
 	tokA := fix.ChannelA.Token
-	tokA.Ts = time.Now().Unix()
-
+	tokA.Ts = time.Now().Unix() // refresh ts so Pair() doesn't reject stale fixture token
 	goPaired, err := goCh.Pair(ctx, tokA, 86400)
 	if err != nil {
 		t.Fatalf("goCh.Pair with TS channelA token: %v", err)
 	}
-
-	// 3. Verify Go's pathId for this pair matches independent formula.
-	expectedGoPathID := pathIDFromB64u(t, goCh.PublicKeyB64u(), fix.ChannelA.Token.Pubkey)
-	if goPaired.PathID() != expectedGoPathID {
-		t.Errorf("goPaired.PathID() mismatch:\n  got:  %s\n  want: %s", goPaired.PathID(), expectedGoPathID)
+	expectedGoPairPathID := pathIDFromB64u(t, goCh.PublicKeyB64u(), fix.ChannelA.Token.Pubkey)
+	if goPaired.PathID() != expectedGoPairPathID {
+		t.Errorf("fresh Go pair pathId:\n  got:  %s\n  want: %s", goPaired.PathID(), expectedGoPairPathID)
 	}
 
-	// 4. Go encrypts with the Go↔TSA shared key and verifies self-decrypt.
-	aadBytes, err := base64.RawURLEncoding.DecodeString(fix.AAD)
-	if err != nil {
-		t.Fatalf("decoding AAD: %v", err)
-	}
-	plaintext := []byte("Hello from casket-go — interop check")
-
-	goCT, err := goPaired.EncryptBody(plaintext, aadBytes)
-	if err != nil {
-		t.Fatalf("EncryptBody: %v", err)
-	}
-	goDecrypted, err := goPaired.DecryptBody(goCT, aadBytes)
-	if err != nil {
-		t.Fatalf("DecryptBody (Go self-decrypt): %v", err)
-	}
-	if string(goDecrypted) != string(plaintext) {
-		t.Errorf("Go self-decrypt: got %q, want %q", goDecrypted, plaintext)
-	}
-
-	// 5. Ciphertext layout sanity: nonce (12) || ciphertext+tag (≥ 16+len(plaintext)).
-	const nonceSize, tagSize = 12, 16
-	if len(goCT) < nonceSize+tagSize+len(plaintext) {
-		t.Errorf("ciphertext too short: %d bytes", len(goCT))
-	}
-
-	t.Logf("alg=%s pathId=%s goPairedPathId=%s ct=%d bytes — OK",
-		alg, fix.ExpectedPathID, goPaired.PathID(), len(goCT))
+	t.Logf("alg=%s TS-pathId=%s TS→Go-decrypt=OK Go→Go-decrypt=OK fresh-pair-pathId=%s",
+		alg, fix.ExpectedPathID, goPaired.PathID())
 }
 
-func TestInterop_P256_PathIDAndEncrypt(t *testing.T) {
+func TestInterop_P256_FullRoundTrip(t *testing.T) {
 	runInteropTest(t, casket.P256)
 }
 
-func TestInterop_X25519_PathIDAndEncrypt(t *testing.T) {
+func TestInterop_X25519_FullRoundTrip(t *testing.T) {
 	runInteropTest(t, casket.X25519)
 }
 
-// TestInterop_SignatureFormat verifies Ed25519 signatures are 64 bytes
-// and base64url-encode to 86 chars with no +/= chars — matching TS wire format.
+// TestInterop_SignatureFormat verifies Ed25519 signatures are 64 bytes and
+// base64url-encode to 86 chars — matching the TS wire format.
 func TestInterop_SignatureFormat(t *testing.T) {
 	_, _, pa, _ := makePair(t, casket.P256)
 	msg := []byte("test envelope bytes")
@@ -215,8 +261,8 @@ func TestInterop_SignatureFormat(t *testing.T) {
 	}
 }
 
-// TestInterop_PairingTokenJSONShape verifies the Go PairingToken JSON
-// has exactly the field names casket-ts expects.
+// TestInterop_PairingTokenJSONShape verifies the Go PairingToken JSON has
+// exactly the field names casket-ts expects on the wire.
 func TestInterop_PairingTokenJSONShape(t *testing.T) {
 	ctx := context.Background()
 	ch, _ := casket.Load(ctx, "nexus-a", newMemStorage(), casket.P256)
