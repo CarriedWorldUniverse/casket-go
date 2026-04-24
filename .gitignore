@@ -1,0 +1,8 @@
+# Go
+/vendor/
+*.test
+*.out
+coverage.html
+
+# Test fixtures generated at runtime
+/testdata/interop-fixture.json
