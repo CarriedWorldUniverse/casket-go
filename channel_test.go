@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	casket "github.com/nexus-cw/casket-go"
+	casket "github.com/CarriedWorldUniverse/casket-go"
 )
 
 // memStorage is an in-process ChannelStorage backed by a map.
