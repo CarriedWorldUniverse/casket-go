@@ -1,4 +1,4 @@
-module github.com/nexus-cw/casket-go
+module github.com/CarriedWorldUniverse/casket-go
 
 go 1.22
 

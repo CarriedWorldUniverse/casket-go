@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	casket "github.com/nexus-cw/casket-go"
+	casket "github.com/CarriedWorldUniverse/casket-go"
 )
 
 type interopChannelData struct {
