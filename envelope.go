@@ -20,7 +20,7 @@
 //	[1]      version (0x01)
 //	[2]      keytype (0x01 derived-repo, 0x02 byok-repo, 0x03 aspect-identity; metadata)
 //	[3..18]  keyref  (16-byte casket key fingerprint)
-//	[19]     flags   (0x00 single-shot; bit0 reserved for framed, rejected for now)
+//	[19]     flags   (0x00 single-shot; bit0 = framed/STREAM, see envelope_framed.go)
 //
 // AAD (authenticated, not encrypted) — length-prefixed so the two caller-supplied
 // fields cannot be ambiguously re-split:
@@ -84,8 +84,9 @@ const (
 	descOffKeyRef  = 3              // [3..18]
 	descOffFlags   = keyRefSize + 3 // 19
 
-	// flagFramed is reserved (bit0). Single-shot envelopes set flags == 0x00.
-	// Open rejects any non-zero flags for now with a clear error.
+	// flagFramed (bit0) marks a framed/STREAM envelope (see envelope_framed.go).
+	// Single-shot envelopes set flags == 0x00; single-shot Open rejects flagFramed
+	// and framed Open rejects flags without it.
 	flagFramed byte = 0x01
 )
 
@@ -313,7 +314,7 @@ func Open(key, blob, repoIdentity, objectPath []byte) (plaintext []byte, desc De
 	}
 	if desc.Flags != 0x00 {
 		if desc.Flags&flagFramed != 0 {
-			return nil, Descriptor{}, openError("framed envelopes are not supported yet (flags bit0 set)")
+			return nil, Descriptor{}, openError("framed envelope passed to single-shot Open; use OpenFramed / NewOpenReader")
 		}
 		return nil, Descriptor{}, openError(fmt.Sprintf("unsupported flags 0x%02x", desc.Flags))
 	}
