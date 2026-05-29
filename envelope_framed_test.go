@@ -48,7 +48,7 @@ func TestFramedRoundTripAllSuitesSizes(t *testing.T) {
 				blob, err := SealFramed(key, pt, SealOptions{
 					Suite:        suite,
 					KeyType:      KeyTypeBYOKRepo,
-					KeyRef:       Fingerprint(key),
+					KeyRef:       testKeyRef(),
 					RepoIdentity: repo,
 					ObjectPath:   path,
 				})
@@ -139,6 +139,12 @@ func prefixLenFor(t *testing.T, suite Suite) int {
 	return pl
 }
 
+// framedHdrLen is the on-wire framed header length: descriptor + salt + prefix.
+func framedHdrLen(t *testing.T, suite Suite) int {
+	t.Helper()
+	return descriptorSize + framedSaltSize + prefixLenFor(t, suite)
+}
+
 // --- 2. truncation: drop the final block ---
 
 func TestFramedTruncationRejected(t *testing.T) {
@@ -151,13 +157,13 @@ func TestFramedTruncationRejected(t *testing.T) {
 		t.Run(suiteName(suite), func(t *testing.T) {
 			// 3 segments worth of plaintext (2 full + remainder).
 			pt := deterministicPlaintext(2*S + 5)
-			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 			if err != nil {
 				t.Fatalf("SealFramed: %v", err)
 			}
 			bs := blockSizeFor(t, suite)
 			// Header = descriptor + prefix.
-			hdr := descriptorSize + prefixLenFor(t, suite)
+			hdr := framedHdrLen(t, suite)
 			// Body = 2 full blocks (bs each) + final remainder block.
 			// Drop the final block entirely → stream ends without a final-flagged
 			// segment, and the now-last full block can't verify as final.
@@ -189,12 +195,12 @@ func TestFramedReorderRejected(t *testing.T) {
 		t.Run(suiteName(suite), func(t *testing.T) {
 			// 3 full segments + remainder → at least 3 non-final blocks.
 			pt := deterministicPlaintext(3*S + 4)
-			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 			if err != nil {
 				t.Fatalf("SealFramed: %v", err)
 			}
 			bs := blockSizeFor(t, suite)
-			hdr := descriptorSize + prefixLenFor(t, suite)
+			hdr := framedHdrLen(t, suite)
 			swapped := append([]byte(nil), blob...)
 			// Swap block 0 and block 1 (both non-final, both full bs).
 			b0 := swapped[hdr : hdr+bs]
@@ -222,12 +228,12 @@ func TestFramedSegmentTamperRejected(t *testing.T) {
 	for _, suite := range allSuites {
 		t.Run(suiteName(suite), func(t *testing.T) {
 			pt := deterministicPlaintext(3*S + 1)
-			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 			if err != nil {
 				t.Fatalf("SealFramed: %v", err)
 			}
 			bs := blockSizeFor(t, suite)
-			hdr := descriptorSize + prefixLenFor(t, suite)
+			hdr := framedHdrLen(t, suite)
 
 			// Flip a ciphertext byte in the middle (second) block.
 			ctTamper := append([]byte(nil), blob...)
@@ -255,7 +261,7 @@ func TestFramedDescriptorBindingRejected(t *testing.T) {
 	repo, path := framedRepoPath()
 	pt := deterministicPlaintext(2*S + 3)
 
-	blob, err := SealFramed(key, pt, SealOptions{Suite: SuiteXChaCha20, KeyType: KeyTypeDerivedRepo, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	blob, err := SealFramed(key, pt, SealOptions{Suite: SuiteXChaCha20, KeyType: KeyTypeDerivedRepo, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("SealFramed: %v", err)
 	}
@@ -288,7 +294,7 @@ func TestFramedAADAmbiguityRejected(t *testing.T) {
 	key := testKey()
 	blob, err := SealFramed(key, deterministicPlaintext(40), SealOptions{
 		Suite:        SuiteXChaCha20,
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: []byte("ab"),
 		ObjectPath:   []byte("c"),
 	})
@@ -308,13 +314,13 @@ func TestFramedAADFieldOverflowRejected(t *testing.T) {
 	key := testKey()
 	big := make([]byte, maxU16Field+1)
 	// Seal path.
-	if _, err := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: big, ObjectPath: []byte("p")}); err == nil {
+	if _, err := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: big, ObjectPath: []byte("p")}); err == nil {
 		t.Fatal("SealFramed accepted >64KiB repo identity")
 	} else if !errors.Is(err, ErrEnvelopeSeal) {
 		t.Fatalf("wrong error type: %v", err)
 	}
 	// Open path.
-	blob, err := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: []byte("r"), ObjectPath: []byte("p")})
+	blob, err := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: []byte("r"), ObjectPath: []byte("p")})
 	if err != nil {
 		t.Fatalf("SealFramed: %v", err)
 	}
@@ -333,7 +339,7 @@ func TestCrossModeRejection(t *testing.T) {
 	repo, path := []byte("r"), []byte("p")
 
 	// Single-shot Open must reject a framed blob.
-	framedBlob, err := SealFramed(key, deterministicPlaintext(40), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	framedBlob, err := SealFramed(key, deterministicPlaintext(40), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("SealFramed: %v", err)
 	}
@@ -344,7 +350,7 @@ func TestCrossModeRejection(t *testing.T) {
 	}
 
 	// Framed Open must reject a single-shot blob.
-	ssBlob, err := Seal(key, []byte("hi"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	ssBlob, err := Seal(key, []byte("hi"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -365,7 +371,7 @@ func TestFramedStreamingUnalignedWrites(t *testing.T) {
 
 	pt := deterministicPlaintext(5*S + 9)
 	var buf bytes.Buffer
-	w, err := NewSealWriter(&buf, key, SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	w, err := NewSealWriter(&buf, key, SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("NewSealWriter: %v", err)
 	}
@@ -435,7 +441,7 @@ func TestFramedStreamingRealSegmentSize(t *testing.T) {
 	S := framedSegSize
 	pt := deterministicPlaintext(5 * S) // exact multiple → last full segment is final
 
-	blob, err := SealFramed(key, pt, SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	blob, err := SealFramed(key, pt, SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("SealFramed: %v", err)
 	}
@@ -460,13 +466,22 @@ func TestFramedStreamingRealSegmentSize(t *testing.T) {
 	}
 }
 
-// --- 8. framed KAT (locks the framed wire format) ---
+// --- 8. framed KATs (lock the framed wire format, per suite) ---
 
-// Framed KAT for the default suite (XChaCha20). Generated via
-// sealFramedWithPrefix with a deterministic 19-byte nonce prefix and a small
-// framedSegSize so the vector spans multiple segments. Regenerate by running
-// with -update-framed-kat... (manual: print got below).
+// Framed KATs are generated via sealFramedWithPrefix with a deterministic
+// per-stream salt + nonce prefix and a small framedSegSize so each vector spans
+// multiple segments. New wire layout:
+//
+//	blob = DESCRIPTOR(20B) || SALT(32B) || noncePrefix(nonceSize-5) || blocks...
+//
+// keyref = testKeyRef() (opaque, fixed); KeyType = KeyTypeDerivedRepo (0x01).
+// framedKey = HKDF-SHA256(key, salt, "casket-envelope-framed-v1").
+// framed AAD includes uint32be(framedSegSize). To regenerate, blank blobHex and
+// the test will print the computed blob.
 type framedKAT struct {
+	name      string
+	suite     Suite
+	saltHex   string
 	prefixHex string
 	segSize   int
 	repo      string
@@ -475,55 +490,95 @@ type framedKAT struct {
 	blobHex   string
 }
 
-var framedKATVector = framedKAT{
-	// prefix length for XChaCha20 = 24 - 5 = 19 bytes.
-	prefixHex: "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2",
-	segSize:   16,
-	repo:      "cairn/repo-42",
-	path:      "objects/ab/cdef.bin",
-	// 35 bytes → 2 full 16-byte segments + 3-byte final remainder (3 segments).
-	ptHex:   "00112233445566778899aabbccddeeff0123456789abcdef0123456789abcdef012345",
-	blobHex: "0301015a1bcc51a25aae05d215e40ce89fd5a601d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e22d8a0dfd32734ef89ff571c090e772ee08c1f87b0224193ecb5730bf39eb218a4357edfec005098a1e2e38998d67a86e13e790bedd790fe6f82df53e446f64ea5de1a85def99c19a3a953fd509b83516d50860",
+const (
+	// Deterministic per-stream salt (32 bytes) shared across the framed KATs.
+	framedKATSaltHex = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f"
+	// 35-byte plaintext → with segSize 16: 2 full 16-byte segments + 3-byte final
+	// remainder (3 segments).
+	framedKATPlainHex = "00112233445566778899aabbccddeeff0123456789abcdef0123456789abcdef012345"
+)
+
+var framedKATVectors = []framedKAT{
+	{
+		name:  "XChaCha20-Poly1305",
+		suite: SuiteXChaCha20,
+		// prefix length for XChaCha20 = 24 - 5 = 19 bytes.
+		saltHex:   framedKATSaltHex,
+		prefixHex: "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2",
+		segSize:   16,
+		repo:      "cairn/repo-42",
+		path:      "objects/ab/cdef.bin",
+		ptHex:     framedKATPlainHex,
+		blobHex:   "0301015a1b2c3d4e5f60718293a4b5c6d7e8f901f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0fd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e256cad6ee196644954c1713ac566f16422d5032459d13861b67d41704ed123a9543f2d42ee910bf8c5de7d0c8486e560920fdb7b0073a5422ab8c772dd73a56ca02b6052fc9256a0f143fffe6fc74a74ddc6c71",
+	},
+	{
+		name:  "AES-256-GCM",
+		suite: SuiteAESGCM,
+		// prefix length for AES-GCM = 12 - 5 = 7 bytes.
+		saltHex:   framedKATSaltHex,
+		prefixHex: "c0c1c2c3c4c5c6",
+		segSize:   16,
+		repo:      "cairn/repo-42",
+		path:      "objects/ab/cdef.bin",
+		ptHex:     framedKATPlainHex,
+		blobHex:   "0101015a1b2c3d4e5f60718293a4b5c6d7e8f901f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0fc0c1c2c3c4c5c6227528973119e6eddf5c4fe2326f18f5d3c4ef024fca83d91bb598c699d0580c9a4fadab020613bad4eab8efb1e4197bde5c2bf70e4d0ffd41459fab4fbe6dd2ef87b7d19779754d352df68e7e77114429a9f1",
+	},
+	{
+		name:  "ChaCha20-Poly1305",
+		suite: SuiteChaCha20,
+		// prefix length for ChaCha20 = 12 - 5 = 7 bytes.
+		saltHex:   framedKATSaltHex,
+		prefixHex: "c0c1c2c3c4c5c6",
+		segSize:   16,
+		repo:      "cairn/repo-42",
+		path:      "objects/ab/cdef.bin",
+		ptHex:     framedKATPlainHex,
+		blobHex:   "0201015a1b2c3d4e5f60718293a4b5c6d7e8f901f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0fc0c1c2c3c4c5c683465222cb13801f854fe8ee2682e51f9c1d59ea89f3479755bfa83a5589d58a6fb97ebafd0d68024e6649c87f3f3f03b24ede81739040b0c526c901e60d69bd3f1ba51b96ed3f2fdbadfe566daa01f78bdc88",
+	},
 }
 
-func TestFramedKnownAnswerVector(t *testing.T) {
-	v := framedKATVector
-	withSegSize(t, v.segSize)
-	key := testKey()
-	fp := Fingerprint(key)
-	prefix := mustHex(t, v.prefixHex)
-	pt := mustHex(t, v.ptHex)
+func TestFramedKnownAnswerVectors(t *testing.T) {
+	for _, v := range framedKATVectors {
+		t.Run(v.name, func(t *testing.T) {
+			withSegSize(t, v.segSize)
+			key := testKey()
+			fp := testKeyRef()
+			salt := mustHex(t, v.saltHex)
+			prefix := mustHex(t, v.prefixHex)
+			pt := mustHex(t, v.ptHex)
 
-	opts := SealOptions{
-		Suite:        SuiteXChaCha20,
-		KeyType:      KeyTypeDerivedRepo,
-		KeyRef:       fp,
-		RepoIdentity: []byte(v.repo),
-		ObjectPath:   []byte(v.path),
-	}
-	got, err := sealFramedWithPrefix(key, pt, opts, prefix)
-	if err != nil {
-		t.Fatalf("sealFramedWithPrefix: %v", err)
-	}
+			opts := SealOptions{
+				Suite:        v.suite,
+				KeyType:      KeyTypeDerivedRepo,
+				KeyRef:       fp,
+				RepoIdentity: []byte(v.repo),
+				ObjectPath:   []byte(v.path),
+			}
+			got, err := sealFramedWithPrefix(key, pt, opts, salt, prefix)
+			if err != nil {
+				t.Fatalf("sealFramedWithPrefix: %v", err)
+			}
 
-	if v.blobHex == "" {
-		t.Fatalf("framed KAT blob not yet committed; generated blob =\n%s", hex.EncodeToString(got))
-	}
-	want := mustHex(t, v.blobHex)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("framed KAT mismatch:\n got %s\nwant %s", hex.EncodeToString(got), v.blobHex)
-	}
+			if v.blobHex == "" {
+				t.Fatalf("framed KAT blob not yet committed; generated blob =\n%s", hex.EncodeToString(got))
+			}
+			want := mustHex(t, v.blobHex)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("framed KAT mismatch:\n got %s\nwant %s", hex.EncodeToString(got), v.blobHex)
+			}
 
-	// And it must open back to the plaintext.
-	rt, desc, err := OpenFramed(key, want, []byte(v.repo), []byte(v.path))
-	if err != nil {
-		t.Fatalf("OpenFramed(KAT): %v", err)
-	}
-	if !bytes.Equal(rt, pt) {
-		t.Fatalf("framed KAT did not round-trip")
-	}
-	if desc.Flags&flagFramed == 0 || desc.Suite != SuiteXChaCha20 {
-		t.Fatalf("framed KAT descriptor wrong: %+v", desc)
+			// And it must open back to the plaintext.
+			rt, desc, err := OpenFramed(key, want, []byte(v.repo), []byte(v.path))
+			if err != nil {
+				t.Fatalf("OpenFramed(KAT): %v", err)
+			}
+			if !bytes.Equal(rt, pt) {
+				t.Fatalf("framed KAT did not round-trip")
+			}
+			if desc.Flags&flagFramed == 0 || desc.Suite != v.suite {
+				t.Fatalf("framed KAT descriptor wrong: %+v", desc)
+			}
+		})
 	}
 }
 
@@ -533,7 +588,7 @@ func TestFramedWrongKeyRejected(t *testing.T) {
 	withSegSize(t, 16)
 	key := testKey()
 	repo, path := framedRepoPath()
-	blob, err := SealFramed(key, deterministicPlaintext(40), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	blob, err := SealFramed(key, deterministicPlaintext(40), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("SealFramed: %v", err)
 	}
@@ -560,7 +615,7 @@ func TestFramedWrongKeyLengthRejected(t *testing.T) {
 		}
 	}
 	// Open with short key.
-	blob, err := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+	blob, err := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 	if err != nil {
 		t.Fatalf("SealFramed: %v", err)
 	}
@@ -580,16 +635,20 @@ func TestFramedMalformedNoPanic(t *testing.T) {
 		"empty":            {},
 		"short-descriptor": make([]byte, 5),
 		"descriptor-only": func() []byte {
-			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
+			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
 			return b[:descriptorSize]
 		}(),
-		"desc-but-no-body": func() []byte {
-			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
-			return b[:descriptorSize+5]
+		"desc-but-partial-salt": func() []byte {
+			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
+			return b[:descriptorSize+5] // truncates inside the 32-byte salt
+		}(),
+		"salt-but-partial-prefix": func() []byte {
+			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
+			return b[:descriptorSize+framedSaltSize+2] // truncates inside the prefix
 		}(),
 		"header-but-noblock": func() []byte {
-			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: Fingerprint(key), RepoIdentity: repo, ObjectPath: path})
-			return b[:descriptorSize+prefixLenFor(t, SuiteXChaCha20)]
+			b, _ := SealFramed(key, []byte("x"), SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
+			return b[:framedHdrLen(t, SuiteXChaCha20)]
 		}(),
 	}
 	for name, b := range cases {
@@ -598,6 +657,81 @@ func TestFramedMalformedNoPanic(t *testing.T) {
 				t.Fatalf("OpenFramed accepted malformed input (%s)", name)
 			} else if !errors.Is(err, ErrEnvelopeOpen) {
 				t.Fatalf("wrong error type for %s: %v", name, err)
+			}
+		})
+	}
+}
+
+// --- 10. segment-size binding (FIX #3): a blob sealed at one framedSegSize must
+// fail to open under a different framedSegSize. Because framedSegSize is bound
+// into the framed AAD, the mismatch surfaces as an AEAD verification error, not a
+// panic or silent mis-parse.
+
+func TestFramedSegSizeMismatchRejected(t *testing.T) {
+	key := testKey()
+	repo, path := framedRepoPath()
+	pt := deterministicPlaintext(40)
+
+	// Seal at segment size 16.
+	var blob []byte
+	func() {
+		withSegSize(t, 16)
+		b, err := SealFramed(key, pt, SealOptions{Suite: SuiteXChaCha20, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
+		if err != nil {
+			t.Fatalf("SealFramed: %v", err)
+		}
+		blob = b
+	}()
+
+	// Open at a different segment size (32). The block boundaries differ AND the
+	// AAD's bound segment size differs, so it must fail — not panic.
+	withSegSize(t, 32)
+	if _, _, err := OpenFramed(key, blob, repo, path); err == nil {
+		t.Fatal("OpenFramed accepted blob under mismatched framedSegSize")
+	} else if !errors.Is(err, ErrEnvelopeOpen) {
+		t.Fatalf("wrong error type: %v", err)
+	}
+
+	// Sanity: opening at the matching size succeeds.
+	withSegSize(t, 16)
+	if _, _, err := OpenFramed(key, blob, repo, path); err != nil {
+		t.Fatalf("OpenFramed at matching segment size failed: %v", err)
+	}
+}
+
+// --- 11. block duplication: duplicating a non-final block must be rejected. The
+// per-segment nonce counter binds position, so a duplicated block decrypts under
+// the wrong index and fails AEAD verification.
+
+func TestFramedBlockDuplicationRejected(t *testing.T) {
+	const S = 16
+	withSegSize(t, S)
+	key := testKey()
+	repo, path := framedRepoPath()
+
+	for _, suite := range allSuites {
+		t.Run(suiteName(suite), func(t *testing.T) {
+			// 3 full segments + remainder → ≥3 non-final blocks.
+			pt := deterministicPlaintext(3*S + 4)
+			blob, err := SealFramed(key, pt, SealOptions{Suite: suite, KeyRef: testKeyRef(), RepoIdentity: repo, ObjectPath: path})
+			if err != nil {
+				t.Fatalf("SealFramed: %v", err)
+			}
+			bs := blockSizeFor(t, suite)
+			hdr := framedHdrLen(t, suite)
+
+			// Duplicate block 0 (a non-final full block): insert a second copy of it
+			// right after itself, shifting the rest along.
+			block0 := append([]byte(nil), blob[hdr:hdr+bs]...)
+			dup := make([]byte, 0, len(blob)+bs)
+			dup = append(dup, blob[:hdr+bs]...) // header + block 0
+			dup = append(dup, block0...)        // duplicated block 0
+			dup = append(dup, blob[hdr+bs:]...) // remaining blocks
+
+			if _, _, err := OpenFramed(key, dup, repo, path); err == nil {
+				t.Fatal("OpenFramed accepted a duplicated block")
+			} else if !errors.Is(err, ErrEnvelopeOpen) {
+				t.Fatalf("wrong error type: %v", err)
 			}
 		})
 	}

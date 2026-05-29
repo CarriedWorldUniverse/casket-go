@@ -2,7 +2,6 @@ package casket
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"testing"
@@ -16,6 +15,16 @@ func testKey() []byte {
 		key[i] = byte(i)
 	}
 	return key
+}
+
+// testKeyRef is a fixed, opaque 16-byte key identifier used across tests. keyref
+// is supplied by the caller (assigned by nexus) and is NOT derived from key
+// material, so tests hardcode a literal constant.
+func testKeyRef() [16]byte {
+	return [16]byte{
+		0x5a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71,
+		0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8, 0xf9,
+	}
 }
 
 func mustHex(t *testing.T, s string) []byte {
@@ -52,7 +61,7 @@ func TestSealOpenRoundTripAllSuites(t *testing.T) {
 
 	for _, suite := range allSuites {
 		t.Run(suiteName(suite), func(t *testing.T) {
-			fp := Fingerprint(key)
+			fp := testKeyRef()
 			blob, err := Seal(key, pt, SealOptions{
 				Suite:        suite,
 				KeyType:      KeyTypeBYOKRepo,
@@ -93,7 +102,7 @@ func TestSealDefaultSuiteIsXChaCha(t *testing.T) {
 	key := testKey()
 	blob, err := Seal(key, []byte("x"), SealOptions{
 		// Suite left zero — must default to XChaCha20.
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: []byte("r"),
 		ObjectPath:   []byte("p"),
 	})
@@ -115,7 +124,7 @@ func sealForTamper(t *testing.T, suite Suite) (key, blob, repo, path, pt []byte)
 	pt = []byte("secret payload")
 	b, err := Seal(key, pt, SealOptions{
 		Suite:        suite,
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: repo,
 		ObjectPath:   path,
 	})
@@ -200,7 +209,7 @@ func TestAADLengthPrefixAmbiguity(t *testing.T) {
 	key := testKey()
 	blob, err := Seal(key, []byte("payload"), SealOptions{
 		Suite:        SuiteXChaCha20,
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: []byte("ab"),
 		ObjectPath:   []byte("c"),
 	})
@@ -227,7 +236,7 @@ func TestAADFieldOverflowRejected(t *testing.T) {
 	// Seal rejects an oversized repo identity.
 	if _, err := Seal(key, []byte("x"), SealOptions{
 		Suite:        SuiteXChaCha20,
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: big,
 		ObjectPath:   []byte("p"),
 	}); err == nil {
@@ -239,7 +248,7 @@ func TestAADFieldOverflowRejected(t *testing.T) {
 	// Seal rejects an oversized object path.
 	if _, err := Seal(key, []byte("x"), SealOptions{
 		Suite:        SuiteXChaCha20,
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: []byte("r"),
 		ObjectPath:   big,
 	}); err == nil {
@@ -251,7 +260,7 @@ func TestAADFieldOverflowRejected(t *testing.T) {
 	// Open rejects oversized fields too (before AAD reconstruction).
 	blob, err := Seal(key, []byte("x"), SealOptions{
 		Suite:        SuiteXChaCha20,
-		KeyRef:       Fingerprint(key),
+		KeyRef:       testKeyRef(),
 		RepoIdentity: []byte("r"),
 		ObjectPath:   []byte("p"),
 	})
@@ -363,28 +372,34 @@ func TestOpenRejectsTruncatedBlobNoPanic(t *testing.T) {
 	}
 }
 
-// --- 4. fingerprint ---
+// --- 4. keyref is opaque (caller-supplied, not derived from key) ---
 
-func TestFingerprintDeterministicAndDomainSeparated(t *testing.T) {
+// keyref must round-trip verbatim into the descriptor: the library treats it as
+// an opaque caller-supplied identifier and never derives it from key material.
+func TestKeyRefIsOpaqueCallerSupplied(t *testing.T) {
 	key := testKey()
-	a := Fingerprint(key)
-	b := Fingerprint(key)
-	if a != b {
-		t.Fatal("Fingerprint not deterministic")
+	ref := testKeyRef()
+	blob, err := Seal(key, []byte("x"), SealOptions{
+		Suite:        SuiteXChaCha20,
+		KeyRef:       ref,
+		RepoIdentity: []byte("r"),
+		ObjectPath:   []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
 	}
-	if len(a) != 16 {
-		t.Fatalf("Fingerprint length = %d want 16", len(a))
+	// The descriptor's keyref bytes [3..18] must equal exactly what the caller
+	// supplied — no hashing of key material.
+	if !bytes.Equal(blob[descOffKeyRef:descOffKeyRef+keyRefSize], ref[:]) {
+		t.Fatalf("keyref not stored verbatim: got %x want %x",
+			blob[descOffKeyRef:descOffKeyRef+keyRefSize], ref[:])
 	}
-	// Must differ from raw SHA-256(key)[:16] (domain separation).
-	raw := sha256.Sum256(key)
-	if bytes.Equal(a[:], raw[:16]) {
-		t.Fatal("Fingerprint equals raw SHA-256(key)[:16] — domain separation missing")
+	_, desc, err := Open(key, blob, []byte("r"), []byte("p"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	// Different keys → different fingerprints.
-	key2 := testKey()
-	key2[0] ^= 0xFF
-	if Fingerprint(key2) == a {
-		t.Fatal("Fingerprint collision for different keys")
+	if desc.KeyRef != ref {
+		t.Fatalf("parsed keyref mismatch: got %x want %x", desc.KeyRef, ref)
 	}
 }
 
@@ -441,40 +456,41 @@ type kat struct {
 }
 
 // Vectors generated via sealWithNonce (deterministic). key = bytes 0x00..0x1f;
-// keyref = Fingerprint(key); KeyType = KeyTypeDerivedRepo (0x01).
+// keyref = testKeyRef() (a fixed opaque caller-supplied identifier, NOT derived
+// from the key); KeyType = KeyTypeDerivedRepo (0x01).
 var katVectors = []kat{
 	{
 		name:     "XChaCha20-Poly1305 (default suite)",
 		suite:    SuiteXChaCha20,
 		keyHex:   "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-		keyrefHx: "5a1bcc51a25aae05d215e40ce89fd5a6",
+		keyrefHx: "5a1b2c3d4e5f60718293a4b5c6d7e8f9",
 		nonceHex: "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7",
 		repo:     "cairn/repo-42",
 		path:     "objects/ab/cdef.bin",
 		pt:       "the quick brown fox jumps over the lazy dog",
-		blobHex:  "0301015a1bcc51a25aae05d215e40ce89fd5a600b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c71c3e1c779886ae568f96b66accb1908223e21239cc9e4e816333de69a6003583f3d0c41754dac3c07815aab0c5b0e557d8773ef81adb931bbf6dfd",
+		blobHex:  "0301015a1b2c3d4e5f60718293a4b5c6d7e8f900b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c71c3e1c779886ae568f96b66accb1908223e21239cc9e4e816333de69a6003583f3d0c41754dac3c07815aab7f4d3a25307012bd5eff77f764404fd",
 	},
 	{
 		name:     "AES-256-GCM",
 		suite:    SuiteAESGCM,
 		keyHex:   "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-		keyrefHx: "5a1bcc51a25aae05d215e40ce89fd5a6",
+		keyrefHx: "5a1b2c3d4e5f60718293a4b5c6d7e8f9",
 		nonceHex: "a0a1a2a3a4a5a6a7a8a9aaab",
 		repo:     "cairn/repo-42",
 		path:     "objects/ab/cdef.bin",
 		pt:       "the quick brown fox jumps over the lazy dog",
-		blobHex:  "0101015a1bcc51a25aae05d215e40ce89fd5a600a0a1a2a3a4a5a6a7a8a9aaab9270190d34be6bdc0945e5a1680daefe16c32130f8c22f1cef2e49f01ad95575ba136793ce582a1d3bf363b8dfcebdf0b87be206c7f6cefdbe9fb1",
+		blobHex:  "0101015a1b2c3d4e5f60718293a4b5c6d7e8f900a0a1a2a3a4a5a6a7a8a9aaab9270190d34be6bdc0945e5a1680daefe16c32130f8c22f1cef2e49f01ad95575ba136793ce582a1d3bf3634defe62df4f2d490928a1436a1b89b5d",
 	},
 	{
 		name:     "ChaCha20-Poly1305 IETF",
 		suite:    SuiteChaCha20,
 		keyHex:   "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-		keyrefHx: "5a1bcc51a25aae05d215e40ce89fd5a6",
+		keyrefHx: "5a1b2c3d4e5f60718293a4b5c6d7e8f9",
 		nonceHex: "a0a1a2a3a4a5a6a7a8a9aaab",
 		repo:     "cairn/repo-42",
 		path:     "objects/ab/cdef.bin",
 		pt:       "the quick brown fox jumps over the lazy dog",
-		blobHex:  "0201015a1bcc51a25aae05d215e40ce89fd5a600a0a1a2a3a4a5a6a7a8a9aaab78c31d7f3c93abcecb2f9166938d93dbfb31ab9f291f0dd3c7f8b4c71410e37804e536e6cfb386aaa2a39264d44e498dca02d82efe93210541bec8",
+		blobHex:  "0201015a1b2c3d4e5f60718293a4b5c6d7e8f900a0a1a2a3a4a5a6a7a8a9aaab78c31d7f3c93abcecb2f9166938d93dbfb31ab9f291f0dd3c7f8b4c71410e37804e536e6cfb386aaa2a3925f84b0a47cda3c7bea1f217ae85192ea",
 	},
 }
 
@@ -485,10 +501,10 @@ func TestKnownAnswerVectors(t *testing.T) {
 			nonce := mustHex(t, v.nonceHex)
 			expectedBlob := mustHex(t, v.blobHex)
 
-			// keyref in the vector must equal Fingerprint(key).
-			fp := Fingerprint(key)
+			// keyref in the vector is a fixed opaque caller-supplied identifier.
+			fp := testKeyRef()
 			if hex.EncodeToString(fp[:]) != v.keyrefHx {
-				t.Fatalf("keyref mismatch: Fingerprint=%s vector=%s", hex.EncodeToString(fp[:]), v.keyrefHx)
+				t.Fatalf("keyref mismatch: testKeyRef=%s vector=%s", hex.EncodeToString(fp[:]), v.keyrefHx)
 			}
 
 			opts := SealOptions{
