@@ -3,7 +3,11 @@
 // The envelope seals a blob (e.g. a cairn object or porter chunk) for storage on
 // an untrusted backing store (S3 etc.). It is independent of the Frame-to-Frame
 // channel layer: the symmetric key is supplied by the caller (resolved by nexus
-// from the descriptor's keyref fingerprint).
+// from the descriptor's keyref).
+//
+// keyref is an opaque key identifier supplied by the caller (assigned by nexus);
+// it MUST NOT be derived from secret key material — it is stored in cleartext on
+// the untrusted backing store.
 //
 // Wire format (single-shot):
 //
@@ -19,7 +23,7 @@
 //	[0]      suite   (0x01 AES-256-GCM, 0x02 ChaCha20-Poly1305, 0x03 XChaCha20-Poly1305)
 //	[1]      version (0x01)
 //	[2]      keytype (0x01 derived-repo, 0x02 byok-repo, 0x03 aspect-identity; metadata)
-//	[3..18]  keyref  (16-byte casket key fingerprint)
+//	[3..18]  keyref  (16-byte opaque key identifier; NOT derived from key material)
 //	[19]     flags   (0x00 single-shot; bit0 = framed/STREAM, see envelope_framed.go)
 //
 // AAD (authenticated, not encrypted) — length-prefixed so the two caller-supplied
@@ -38,7 +42,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -90,10 +93,6 @@ const (
 	flagFramed byte = 0x01
 )
 
-// fingerprintDomain domain-separates the keyref hash from any other hash of the
-// key, so a keyref can never be confused with a raw SHA-256 of the key material.
-var fingerprintDomain = []byte("casket-envelope-keyref-v1")
-
 // Sentinel errors — use errors.Is to test.
 var (
 	ErrEnvelopeSeal = errors.New("envelope seal error")
@@ -110,18 +109,6 @@ type Descriptor struct {
 	KeyType KeyType
 	KeyRef  [16]byte
 	Flags   byte
-}
-
-// Fingerprint computes a domain-separated 16-byte casket keyref for key:
-// SHA-256("casket-envelope-keyref-v1" || key) truncated to the first 16 bytes.
-func Fingerprint(key []byte) [16]byte {
-	h := sha256.New()
-	h.Write(fingerprintDomain)
-	h.Write(key)
-	sum := h.Sum(nil)
-	var fp [16]byte
-	copy(fp[:], sum[:keyRefSize])
-	return fp
 }
 
 // encode serialises the descriptor to its fixed 20-byte wire form.
@@ -235,8 +222,16 @@ type SealOptions struct {
 // generates a fresh random nonce of the suite's nonce length via crypto/rand, and
 // AEAD-seals binding the AAD (descriptor + repo identity + object path).
 //
-// Returns descriptor || nonce || ciphertext || tag. The KeyRef in opts is caller-
-// supplied; use Fingerprint(key) to derive a conventional keyref.
+// Returns descriptor || nonce || ciphertext || tag. The KeyRef in opts is an
+// opaque, caller-supplied key identifier (assigned by nexus); it MUST NOT be
+// derived from secret key material — it is stored in cleartext on the untrusted
+// backing store.
+//
+// Nonce sizing per suite: the 12-byte-nonce suites (AES-256-GCM 0x01,
+// ChaCha20-Poly1305 0x02) use a random 96-bit nonce; with random nonces the
+// birthday bound applies, so keep messages-per-key well under ~2^32 or prefer
+// XChaCha20-Poly1305 (0x03) for high-volume single-shot use. XChaCha's 192-bit
+// nonce makes random-nonce collisions infeasible at scale.
 func Seal(key, plaintext []byte, opts SealOptions) ([]byte, error) {
 	suite := opts.Suite
 	if suite == 0 {

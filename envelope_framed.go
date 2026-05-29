@@ -1,19 +1,32 @@
 // Package casket — framed (streaming) at-rest envelope.
 //
 // The framed mode seals an arbitrarily large blob without holding the whole
-// plaintext (or ciphertext) in memory. It uses the standard STREAM construction
-// (Hoang–Reyhanitabar–Rogaway–Vizár, as deployed by age and Google Tink): the
-// plaintext is split into fixed-size segments, each segment is AEAD-sealed under
-// a per-segment nonce derived from a random prefix plus a 32-bit counter, and the
-// final segment is marked with a distinct nonce flag byte. This binds segment
-// order (the counter) and stream termination (the final flag) into the nonce, so
-// reorder, truncation, duplication, and splice are all rejected by AEAD
-// verification — no separately-authenticated length field is needed.
+// plaintext (or ciphertext) in memory. It uses the Tink-style streaming-AEAD
+// construction (STREAM of Hoang–Reyhanitabar–Rogaway–Vizár, with a per-stream
+// derived key as in Google Tink): a fresh random 32-byte salt is generated per
+// stream and the long-term key is HKDF-expanded into a per-stream subkey; the
+// plaintext is then split into fixed-size segments, each segment AEAD-sealed
+// under the per-stream subkey with a per-segment nonce derived from a random
+// prefix plus a 32-bit counter, and the final segment marked with a distinct
+// nonce flag byte. This binds segment order (the counter) and stream termination
+// (the final flag) into the nonce, so reorder, truncation, duplication, and
+// splice are all rejected by AEAD verification — no separately-authenticated
+// length field is needed.
+//
+// Per-stream key derivation:
+//
+//	framedKey = HKDF-SHA256(secret=key, salt=salt(32B random),
+//	                        info="casket-envelope-framed-v1") → 32 bytes
+//
+// Because each stream uses a distinct random salt, the AEAD subkey differs per
+// stream; cross-stream nonce collisions are therefore infeasible for ALL suites,
+// including the 12-byte-nonce suites whose ~7-byte random prefix would otherwise
+// risk a birthday collision across many streams under one long-term key.
 //
 // Wire format (framed):
 //
-//	blob = DESCRIPTOR(20 bytes, flags bit0 set) || BODY
-//	BODY = noncePrefix(nonceSize-5 bytes) || block_0 || block_1 || ... || block_last
+//	blob = DESCRIPTOR(20 bytes, flags bit0 set) || SALT(32 bytes)
+//	    || noncePrefix(nonceSize-5 bytes) || block_0 || block_1 || ... || block_last
 //	block_i = AEAD.Seal(segment_i) = ciphertext_i || tag_i   (tag is 16 bytes)
 //
 // Per-segment nonce (length = suite nonceSize):
@@ -25,14 +38,18 @@
 //	prefix length is nonceSize-5: AES-GCM / ChaCha20 (12B nonce) → 7;
 //	XChaCha20 (24B nonce) → 19.
 //
-// AAD: the *same* message-level AAD is authenticated for every segment:
+// AAD: the *same* message-level framed AAD is authenticated for every segment:
 //
-//	AAD = descriptor(20B)
+//	framedAAD = descriptor(20B)
 //	   || uint16be(len(repoIdentity)) || repoIdentity
 //	   || uint16be(len(objectPath))   || objectPath
+//	   || uint32be(framedSegSize)
 //
-// (reuse buildAAD). Segment position is bound by the nonce counter and stream
-// termination by the final flag, so the AAD need not vary per segment.
+// (= buildAAD || uint32be(framedSegSize)). Binding the segment size means a
+// seal/open size mismatch fails as an AEAD verification error rather than
+// silently mis-parsing the block boundaries. Segment position is bound by the
+// nonce counter and stream termination by the final flag, so the AAD need not
+// vary per segment.
 //
 // Segmentation rules (identical between seal and open):
 //
@@ -42,7 +59,9 @@
 //     empty segment). Otherwise ceil(L/S) segments. Only the last is final.
 //   - segmentCount must not exceed math.MaxUint32.
 //
-// Open derives boundaries from the body length: with blockSize = framedSegSize+16,
+// Open derives the per-stream framedKey from the descriptor's keyref-identified
+// long-term key plus the on-wire salt, then derives boundaries from the body
+// length: with blockSize = framedSegSize+16,
 // consume full blockSize blocks (finalFlag=0) while the remaining bytes exceed
 // blockSize; the remainder (≤ blockSize) is the final block (finalFlag=1). This
 // makes the exact-multiple case unambiguous: a trailing remainder of exactly
@@ -54,17 +73,22 @@ import (
 	"bytes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+
+	"golang.org/x/crypto/hkdf"
 )
 
-// framedSegSize is the fixed plaintext segment size (64 KiB). It is an unexported
-// package var, not a const, so tests can shrink it to exercise multi-segment
-// behaviour cheaply without changing the shipped wire format. Production code
-// MUST NOT mutate it.
+// framedSegSize is the fixed plaintext segment size. Canonical value is 65536
+// (64 KiB) — a fixed format parameter all implementations MUST use; it is
+// authenticated via the framed AAD, so a seal/open size mismatch fails as an AEAD
+// error rather than silently mis-parsing. The package var exists only so tests
+// can shrink it (it is an unexported var, not a const); production code MUST NOT
+// mutate it.
 var framedSegSize = 65536
 
 // framed nonce layout: ...prefix... || uint32be(counter) || finalFlag(1 byte).
@@ -75,7 +99,38 @@ const (
 
 	framedFinalFlag    byte = 0x01
 	framedNonFinalFlag byte = 0x00
+
+	// framedSaltSize is the per-stream HKDF salt length (32 bytes), written on
+	// the wire immediately after the descriptor and before the nonce prefix.
+	framedSaltSize = 32
 )
+
+// framedHKDFInfo domain-separates the per-stream framed-subkey derivation from
+// any other use of the long-term key (e.g. the channel layer's hkdfInfo).
+var framedHKDFInfo = []byte("casket-envelope-framed-v1")
+
+// deriveFramedKey expands the long-term key into a 32-byte per-stream subkey via
+// HKDF-SHA256(secret=key, salt=salt, info="casket-envelope-framed-v1"). The
+// random per-stream salt makes cross-stream nonce collisions infeasible for all
+// suites.
+func deriveFramedKey(key, salt []byte) ([]byte, error) {
+	r := hkdf.New(sha256.New, key, salt, framedHKDFInfo)
+	out := make([]byte, envelopeKeySize)
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil, fmt.Errorf("HKDF expand framed subkey: %w", err)
+	}
+	return out, nil
+}
+
+// buildFramedAAD appends the authenticated segment size to the message-level AAD:
+// framedAAD = buildAAD(...) || uint32be(framedSegSize). Binding the segment size
+// turns a seal/open size mismatch into an AEAD verification failure.
+func buildFramedAAD(descriptor, repoIdentity, objectPath []byte, segSize int) []byte {
+	aad := buildAAD(descriptor, repoIdentity, objectPath)
+	var sz [4]byte
+	binary.BigEndian.PutUint32(sz[:], uint32(segSize))
+	return append(aad, sz[:]...)
+}
 
 // noncePrefixLen returns the random nonce-prefix length for a suite's AEAD:
 // nonceSize - 5 (4-byte counter + 1-byte final flag).
@@ -118,34 +173,41 @@ func framedDescriptor(suite Suite, opts SealOptions) Descriptor {
 type sealWriter struct {
 	w      io.Writer
 	aead   cipher.AEAD
+	salt   []byte // per-stream HKDF salt (framedSaltSize bytes)
 	prefix []byte // nonce prefix (nonceSize-5 bytes)
-	aad    []byte // message-level AAD (constant across segments)
+	aad    []byte // message-level framed AAD (constant across segments)
 
 	buf     []byte // pending plaintext, < framedSegSize once a segment is flushed
 	index   uint32 // next segment index to emit
-	started bool   // header (descriptor + prefix) written
+	started bool   // header (descriptor + salt + prefix) written
 	closed  bool
 	err     error // sticky error
 }
 
 // NewSealWriter returns an io.WriteCloser that seals everything written to it as
-// a framed envelope written to w, using the STREAM construction. The descriptor
-// (framed flag set) and random nonce prefix are written on the first flush. Each
-// time the internal buffer fills to framedSegSize a non-final segment is sealed
-// and written; Close seals the remaining buffer as the final segment (handling
-// empty and exact-multiple inputs per the segmentation rules). Close is
-// idempotent-safe in that a second call returns an error rather than corrupting
-// output. Key length and AAD fields are validated up front.
+// a framed envelope written to w, using the per-stream-keyed STREAM construction.
+// A fresh random 32-byte salt and the long-term key are HKDF-expanded into the
+// per-stream AEAD subkey. The descriptor (framed flag set), salt, and random
+// nonce prefix are written on the first flush. Each time the internal buffer
+// fills to framedSegSize a non-final segment is sealed and written; Close seals
+// the remaining buffer as the final segment (handling empty and exact-multiple
+// inputs per the segmentation rules). Close is idempotent-safe in that a second
+// call returns an error rather than corrupting output. Key length and AAD fields
+// are validated up front.
 func NewSealWriter(w io.Writer, key []byte, opts SealOptions) (io.WriteCloser, error) {
 	suite := opts.Suite
 	if suite == 0 {
 		suite = defaultSuite
 	}
-	aead, err := newAEAD(suite, key)
-	if err != nil {
+	if err := validateAADFields(opts.RepoIdentity, opts.ObjectPath); err != nil {
 		return nil, sealError(err.Error())
 	}
-	if err := validateAADFields(opts.RepoIdentity, opts.ObjectPath); err != nil {
+	salt := make([]byte, framedSaltSize)
+	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
+		return nil, sealError(fmt.Sprintf("generating framed salt: %v", err))
+	}
+	aead, err := newFramedAEAD(suite, key, salt)
+	if err != nil {
 		return nil, sealError(err.Error())
 	}
 	prefixLen, err := noncePrefixLen(aead)
@@ -156,14 +218,31 @@ func NewSealWriter(w io.Writer, key []byte, opts SealOptions) (io.WriteCloser, e
 	if _, err := io.ReadFull(rand.Reader, prefix); err != nil {
 		return nil, sealError(fmt.Sprintf("generating nonce prefix: %v", err))
 	}
-	return newSealWriterWithPrefix(w, aead, suite, prefix, opts)
+	return newSealWriterWithSaltPrefix(w, aead, suite, salt, prefix, opts)
 }
 
-// newSealWriterWithPrefix is the deterministic seam used by NewSealWriter and by
-// KAT helpers: it takes a caller-supplied nonce prefix instead of a random one.
-func newSealWriterWithPrefix(w io.Writer, aead cipher.AEAD, suite Suite, prefix []byte, opts SealOptions) (io.WriteCloser, error) {
+// newFramedAEAD validates the long-term key length, derives the per-stream subkey
+// via HKDF(key, salt), and builds the suite AEAD from that subkey.
+func newFramedAEAD(suite Suite, key, salt []byte) (cipher.AEAD, error) {
+	if len(key) != envelopeKeySize {
+		return nil, fmt.Errorf("key must be %d bytes, got %d", envelopeKeySize, len(key))
+	}
+	framedKey, err := deriveFramedKey(key, salt)
+	if err != nil {
+		return nil, err
+	}
+	return newAEAD(suite, framedKey)
+}
+
+// newSealWriterWithSaltPrefix is the deterministic seam used by NewSealWriter and
+// by KAT helpers: it takes a caller-supplied salt and nonce prefix instead of
+// random ones. aead must already be built from the per-stream subkey for salt.
+func newSealWriterWithSaltPrefix(w io.Writer, aead cipher.AEAD, suite Suite, salt, prefix []byte, opts SealOptions) (io.WriteCloser, error) {
 	if err := validateAADFields(opts.RepoIdentity, opts.ObjectPath); err != nil {
 		return nil, sealError(err.Error())
+	}
+	if len(salt) != framedSaltSize {
+		return nil, sealError(fmt.Sprintf("framed salt must be %d bytes, got %d", framedSaltSize, len(salt)))
 	}
 	prefixLen, err := noncePrefixLen(aead)
 	if err != nil {
@@ -173,25 +252,28 @@ func newSealWriterWithPrefix(w io.Writer, aead cipher.AEAD, suite Suite, prefix 
 		return nil, sealError(fmt.Sprintf("nonce prefix must be %d bytes for suite 0x%02x, got %d", prefixLen, byte(suite), len(prefix)))
 	}
 	desc := framedDescriptor(suite, opts)
-	aad := buildAAD(desc.encode(), opts.RepoIdentity, opts.ObjectPath)
+	aad := buildFramedAAD(desc.encode(), opts.RepoIdentity, opts.ObjectPath, framedSegSize)
 	return &sealWriter{
 		w:      w,
 		aead:   aead,
+		salt:   append([]byte(nil), salt...),
 		prefix: append([]byte(nil), prefix...),
 		aad:    aad,
 		buf:    make([]byte, 0, framedSegSize),
 	}, nil
 }
 
-// writeHeader emits descriptor + nonce prefix on first use. The descriptor bytes
-// are exactly the first descriptorSize bytes of the AAD, so they are reused here
-// to guarantee the on-wire header and the authenticated descriptor are identical.
+// writeHeader emits descriptor + salt + nonce prefix on first use. The descriptor
+// bytes are exactly the first descriptorSize bytes of the AAD, so they are reused
+// here to guarantee the on-wire header and the authenticated descriptor are
+// identical.
 func (sw *sealWriter) writeHeader() error {
 	if sw.started {
 		return nil
 	}
-	header := make([]byte, 0, descriptorSize+len(sw.prefix))
+	header := make([]byte, 0, descriptorSize+len(sw.salt)+len(sw.prefix))
 	header = append(header, sw.aad[:descriptorSize]...)
+	header = append(header, sw.salt...)
 	header = append(header, sw.prefix...)
 	if _, err := sw.w.Write(header); err != nil {
 		return sealError(fmt.Sprintf("writing framed header: %v", err))
@@ -323,7 +405,13 @@ func NewOpenReader(r io.Reader, key, repoIdentity, objectPath []byte) (io.Reader
 		return nil, openError(fmt.Sprintf("unsupported flags 0x%02x", desc.Flags))
 	}
 
-	aead, err := newAEAD(desc.Suite, key)
+	// Read the per-stream salt, then derive the framed subkey from the long-term
+	// key. The keyref in the descriptor still identifies the long-term key.
+	salt := make([]byte, framedSaltSize)
+	if _, err := io.ReadFull(r, salt); err != nil {
+		return nil, openError(fmt.Sprintf("reading framed salt: %v", err))
+	}
+	aead, err := newFramedAEAD(desc.Suite, key, salt)
 	if err != nil {
 		return nil, openError(err.Error())
 	}
@@ -336,7 +424,7 @@ func NewOpenReader(r io.Reader, key, repoIdentity, objectPath []byte) (io.Reader
 		return nil, openError(fmt.Sprintf("reading nonce prefix: %v", err))
 	}
 
-	aad := buildAAD(descBytes, repoIdentity, objectPath)
+	aad := buildFramedAAD(descBytes, repoIdentity, objectPath, framedSegSize)
 	or := &openReader{
 		r:      r,
 		aead:   aead,
@@ -469,19 +557,19 @@ func SealFramed(key, plaintext []byte, opts SealOptions) ([]byte, error) {
 }
 
 // sealFramedWithPrefix is the deterministic KAT seam: it seals with a
-// caller-supplied nonce prefix so framed wire vectors can be regenerated. The
-// public SealFramed always uses a fresh random prefix.
-func sealFramedWithPrefix(key, plaintext []byte, opts SealOptions, prefix []byte) ([]byte, error) {
+// caller-supplied salt and nonce prefix so framed wire vectors can be
+// regenerated. The public SealFramed always uses a fresh random salt and prefix.
+func sealFramedWithPrefix(key, plaintext []byte, opts SealOptions, salt, prefix []byte) ([]byte, error) {
 	suite := opts.Suite
 	if suite == 0 {
 		suite = defaultSuite
 	}
-	aead, err := newAEAD(suite, key)
+	aead, err := newFramedAEAD(suite, key, salt)
 	if err != nil {
 		return nil, sealError(err.Error())
 	}
 	var buf bytes.Buffer
-	w, err := newSealWriterWithPrefix(&buf, aead, suite, prefix, opts)
+	w, err := newSealWriterWithSaltPrefix(&buf, aead, suite, salt, prefix, opts)
 	if err != nil {
 		return nil, err
 	}
