@@ -57,7 +57,15 @@
 //     remainder. L==0 → exactly one 0-byte (final) segment. L>0 and L%S==0 →
 //     L/S segments, the last a full S-byte segment marked final (no trailing
 //     empty segment). Otherwise ceil(L/S) segments. Only the last is final.
-//   - segmentCount must not exceed math.MaxUint32.
+//   - A framed stream may contain AT MOST 2^32 segments: the segment index is a
+//     uint32, so valid indices are 0..2^32-1 (= math.MaxUint32), 2^32 distinct
+//     values. The last segment is marked final. No index may repeat or wrap. A
+//     non-final segment at index math.MaxUint32 is refused, because emitting the
+//     next (non-final or final) segment would require index 2^32, which wraps the
+//     uint32 back to 0 and would reuse a nonce. A final segment AT index
+//     math.MaxUint32 is legitimate (it is the last, so no further index is
+//     needed). Nonce-index reuse is made structurally impossible by a sticky
+//     "exhausted" flag (see sealWriter.flushSegment).
 //
 // Open derives the per-stream framedKey from the descriptor's keyref-identified
 // long-term key plus the on-wire salt, then derives boundaries from the body
@@ -181,7 +189,13 @@ type sealWriter struct {
 	index   uint32 // next segment index to emit
 	started bool   // header (descriptor + salt + prefix) written
 	closed  bool
-	err     error // sticky error
+	// exhausted becomes true once a segment is sealed at index math.MaxUint32
+	// (the last legitimately usable index). Any further flush attempt would have
+	// to reuse or wrap the index — and thus reuse a nonce — so it is refused.
+	// This makes nonce-index reuse structurally impossible rather than implied by
+	// control flow.
+	exhausted bool
+	err       error // sticky error
 }
 
 // NewSealWriter returns an io.WriteCloser that seals everything written to it as
@@ -320,15 +334,32 @@ func (sw *sealWriter) flushSegment(final bool) error {
 	if err := sw.writeHeader(); err != nil {
 		return err
 	}
+	// No-wrap invariant. Once a segment has been sealed at index math.MaxUint32
+	// (the last usable index), the stream is exhausted: any further flush would
+	// reuse index 0 (uint32 wrap) and therefore reuse a per-segment nonce. Refuse
+	// it unconditionally — this guards both the final and non-final paths and
+	// makes nonce-index reuse structurally impossible.
+	if sw.exhausted {
+		return sealError("framed stream exhausted: a segment was already sealed at index math.MaxUint32; emitting another would wrap the uint32 index and reuse a nonce")
+	}
 	if sw.index == math.MaxUint32 && !final {
-		// Sealing this non-final segment would require a further index beyond
-		// MaxUint32 for the next one; refuse before overflow.
-		return sealError("segment count exceeds math.MaxUint32")
+		// A framed stream may contain at most 2^32 segments (indices 0..2^32-1 =
+		// math.MaxUint32). A non-final segment at index math.MaxUint32 is refused
+		// because the next index would wrap the uint32 back to 0 and reuse a
+		// nonce. (A FINAL segment at index math.MaxUint32 is legitimate — it is the
+		// last, so no further index is needed.)
+		return sealError("framed stream may contain at most 2^32 segments (indices 0..2^32-1 = math.MaxUint32); a non-final segment at index math.MaxUint32 is refused because the next index would wrap")
 	}
 	nonce := segmentNonce(sw.prefix, sw.index, final)
 	block := sw.aead.Seal(nil, nonce, sw.buf, sw.aad)
 	if _, err := sw.w.Write(block); err != nil {
 		return sealError(fmt.Sprintf("writing framed segment %d: %v", sw.index, err))
+	}
+	if sw.index == math.MaxUint32 {
+		// We just sealed the last legitimately usable index (this is necessarily a
+		// final segment, given the non-final guard above). Mark the stream
+		// exhausted so no subsequent flush can reuse/wrap the index.
+		sw.exhausted = true
 	}
 	sw.index++
 	sw.buf = sw.buf[:0]

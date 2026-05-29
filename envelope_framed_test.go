@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"math"
 	"testing"
 )
 
@@ -579,6 +580,101 @@ func TestFramedKnownAnswerVectors(t *testing.T) {
 				t.Fatalf("framed KAT descriptor wrong: %+v", desc)
 			}
 		})
+	}
+}
+
+// --- 8b. segment-index no-wrap boundary (FIX #6) ---
+//
+// The framed segment index is a uint32: valid indices are 0..math.MaxUint32
+// (2^32 values), the last segment marked final, no index repeating or wrapping.
+// These tests drive flushSegment directly at the boundary via the same-package
+// seam (presetting sw.index), so we don't have to write 2^32 segments.
+
+// newTestSealWriter builds a *sealWriter via the internal constructor with a
+// deterministic salt/prefix, returning the concrete type so tests can poke
+// sw.index. The discarding writer means we exercise the index guard, not output.
+func newTestSealWriter(t *testing.T, suite Suite) *sealWriter {
+	t.Helper()
+	key := testKey()
+	salt := make([]byte, framedSaltSize)
+	prefixLenAEAD := prefixLenFor(t, suite)
+	prefix := make([]byte, prefixLenAEAD)
+	aead, err := newFramedAEAD(suite, key, salt)
+	if err != nil {
+		t.Fatalf("newFramedAEAD: %v", err)
+	}
+	wc, err := newSealWriterWithSaltPrefix(io.Discard, aead, suite, salt, prefix, SealOptions{
+		Suite:        suite,
+		KeyRef:       testKeyRef(),
+		RepoIdentity: []byte("r"),
+		ObjectPath:   []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("newSealWriterWithSaltPrefix: %v", err)
+	}
+	return wc.(*sealWriter)
+}
+
+func TestFramedNonFinalAtMaxIndexRefused(t *testing.T) {
+	withSegSize(t, 16)
+	sw := newTestSealWriter(t, SuiteXChaCha20)
+	sw.index = math.MaxUint32
+	// A NON-final flush at index == MaxUint32 must error: the next index would
+	// wrap the uint32 back to 0 and reuse a nonce.
+	err := sw.flushSegment(false)
+	if err == nil {
+		t.Fatal("non-final flush at index==MaxUint32 was accepted; index would wrap")
+	}
+	if !errors.Is(err, ErrEnvelopeSeal) {
+		t.Fatalf("wrong error type: %v", err)
+	}
+	// The stream must NOT be marked exhausted (nothing was sealed) and the index
+	// must be unchanged, so a subsequent FINAL flush at the same index can still
+	// succeed.
+	if sw.exhausted {
+		t.Fatal("stream wrongly marked exhausted after a refused non-final flush")
+	}
+	if sw.index != math.MaxUint32 {
+		t.Fatalf("index advanced past MaxUint32 after refused flush: %d", sw.index)
+	}
+}
+
+func TestFramedFinalAtMaxIndexAccepted(t *testing.T) {
+	withSegSize(t, 16)
+	sw := newTestSealWriter(t, SuiteXChaCha20)
+	sw.index = math.MaxUint32
+	// A FINAL flush at index == MaxUint32 is legitimate: it is the last segment,
+	// no further index is needed.
+	if err := sw.flushSegment(true); err != nil {
+		t.Fatalf("final flush at index==MaxUint32 was refused: %v", err)
+	}
+	// After sealing at MaxUint32 the stream must be exhausted, so no second seal
+	// can reuse/wrap the index.
+	if !sw.exhausted {
+		t.Fatal("stream not marked exhausted after sealing at index==MaxUint32")
+	}
+}
+
+func TestFramedNoTwoSegmentsAtSameIndex(t *testing.T) {
+	withSegSize(t, 16)
+	sw := newTestSealWriter(t, SuiteXChaCha20)
+	sw.index = math.MaxUint32
+	// Seal the final segment at MaxUint32 (legitimate).
+	if err := sw.flushSegment(true); err != nil {
+		t.Fatalf("first (final) flush at MaxUint32: %v", err)
+	}
+	// Any further flush — final or non-final — must be refused by the sticky
+	// exhausted guard, so no two segments can ever be sealed at the same index
+	// (the wrapped index 0 is structurally unreachable).
+	if err := sw.flushSegment(true); err == nil {
+		t.Fatal("second final flush after exhaustion was accepted (would reuse wrapped index 0)")
+	} else if !errors.Is(err, ErrEnvelopeSeal) {
+		t.Fatalf("wrong error type for second final flush: %v", err)
+	}
+	if err := sw.flushSegment(false); err == nil {
+		t.Fatal("non-final flush after exhaustion was accepted (would reuse wrapped index 0)")
+	} else if !errors.Is(err, ErrEnvelopeSeal) {
+		t.Fatalf("wrong error type for non-final flush: %v", err)
 	}
 }
 
