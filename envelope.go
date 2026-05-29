@@ -36,6 +36,11 @@
 // Binding the full descriptor (incl. suite + keyref) plus repo identity and object
 // path prevents header-strip, suite/keyref swap, and cross-repo/cross-object
 // ciphertext substitution.
+//
+// Cross-implementation parity: WIRE.md enumerates every constant, offset, width,
+// and endianness a TS/.NET port MUST match byte-for-byte. The committed KATs
+// (TestKnownAnswerVectors, TestFramedKnownAnswerVectors) are the canonical
+// conformance vectors.
 package casket
 
 import (
