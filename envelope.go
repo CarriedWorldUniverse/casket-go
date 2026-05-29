@@ -200,6 +200,24 @@ func appendU16Prefixed(dst, field []byte) []byte {
 	return dst
 }
 
+// maxU16Field is the largest length a u16-prefixed AAD field may have. Beyond
+// this, uint16(len(field)) would wrap silently and defeat the length-prefix
+// ambiguity protection, so we reject such fields explicitly.
+const maxU16Field = 0xFFFF
+
+// validateAADFields guards the two caller-supplied AAD fields against u16
+// length-prefix overflow. It returns a *raw* error message; callers wrap it with
+// sealError or openError as appropriate.
+func validateAADFields(repoIdentity, objectPath []byte) error {
+	if len(repoIdentity) > maxU16Field {
+		return fmt.Errorf("repo identity exceeds %d bytes", maxU16Field)
+	}
+	if len(objectPath) > maxU16Field {
+		return fmt.Errorf("object path exceeds %d bytes", maxU16Field)
+	}
+	return nil
+}
+
 // SealOptions configures a Seal call.
 // A zero-value Suite defaults to XChaCha20-Poly1305 (0x03).
 type SealOptions struct {
@@ -253,6 +271,9 @@ func sealWithNonce(key, plaintext []byte, opts SealOptions, nonce []byte) ([]byt
 }
 
 func sealCommon(aead cipher.AEAD, suite Suite, nonce, plaintext []byte, opts SealOptions) ([]byte, error) {
+	if err := validateAADFields(opts.RepoIdentity, opts.ObjectPath); err != nil {
+		return nil, sealError(err.Error())
+	}
 	desc := Descriptor{
 		Suite:   suite,
 		Version: envelopeVersion,
@@ -295,6 +316,10 @@ func Open(key, blob, repoIdentity, objectPath []byte) (plaintext []byte, desc De
 			return nil, Descriptor{}, openError("framed envelopes are not supported yet (flags bit0 set)")
 		}
 		return nil, Descriptor{}, openError(fmt.Sprintf("unsupported flags 0x%02x", desc.Flags))
+	}
+
+	if err := validateAADFields(repoIdentity, objectPath); err != nil {
+		return nil, Descriptor{}, openError(err.Error())
 	}
 
 	aead, err := newAEAD(desc.Suite, key)

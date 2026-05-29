@@ -217,6 +217,59 @@ func TestAADLengthPrefixAmbiguity(t *testing.T) {
 	}
 }
 
+// A >64KiB AAD field must be rejected (not silently u16-wrapped) by both
+// Seal and Open. Without the guard, uint16(len) wraps and the AAD ambiguity
+// protection collapses.
+func TestAADFieldOverflowRejected(t *testing.T) {
+	key := testKey()
+	big := make([]byte, maxU16Field+1) // 65536 bytes — wraps to 0 under uint16
+
+	// Seal rejects an oversized repo identity.
+	if _, err := Seal(key, []byte("x"), SealOptions{
+		Suite:        SuiteXChaCha20,
+		KeyRef:       Fingerprint(key),
+		RepoIdentity: big,
+		ObjectPath:   []byte("p"),
+	}); err == nil {
+		t.Fatal("Seal accepted >64KiB repo identity")
+	} else if !errors.Is(err, ErrEnvelopeSeal) {
+		t.Fatalf("wrong error type: %v", err)
+	}
+
+	// Seal rejects an oversized object path.
+	if _, err := Seal(key, []byte("x"), SealOptions{
+		Suite:        SuiteXChaCha20,
+		KeyRef:       Fingerprint(key),
+		RepoIdentity: []byte("r"),
+		ObjectPath:   big,
+	}); err == nil {
+		t.Fatal("Seal accepted >64KiB object path")
+	} else if !errors.Is(err, ErrEnvelopeSeal) {
+		t.Fatalf("wrong error type: %v", err)
+	}
+
+	// Open rejects oversized fields too (before AAD reconstruction).
+	blob, err := Seal(key, []byte("x"), SealOptions{
+		Suite:        SuiteXChaCha20,
+		KeyRef:       Fingerprint(key),
+		RepoIdentity: []byte("r"),
+		ObjectPath:   []byte("p"),
+	})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if _, _, err := Open(key, blob, big, []byte("p")); err == nil {
+		t.Fatal("Open accepted >64KiB repo identity")
+	} else if !errors.Is(err, ErrEnvelopeOpen) {
+		t.Fatalf("wrong error type: %v", err)
+	}
+	if _, _, err := Open(key, blob, []byte("r"), big); err == nil {
+		t.Fatal("Open accepted >64KiB object path")
+	} else if !errors.Is(err, ErrEnvelopeOpen) {
+		t.Fatalf("wrong error type: %v", err)
+	}
+}
+
 // --- 3. descriptor parse ---
 
 func TestDescriptorEncodeDecodeRoundTrip(t *testing.T) {
