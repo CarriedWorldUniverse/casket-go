@@ -5,9 +5,13 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/CarriedWorldUniverse/casket-go.svg)](https://pkg.go.dev/github.com/CarriedWorldUniverse/casket-go)
 [![License](https://img.shields.io/github/license/CarriedWorldUniverse/casket-go)](LICENSE)
 
-Go port of `casket-ts` channel.ts — Ed25519 + ECDH channel identity for Frame-to-Frame relay.
+Go port of the `casket-ts` channel — Ed25519 + ECDH channel identity, plus
+at-rest AEAD envelope encryption and an HKDF-Ed25519 agent-key helper.
 
-Cross-compatible wire format with [casket-ts](https://github.com/CarriedWorldUniverse/casket-ts) (Node.js / Cloudflare Workers) and [casket-dotnet](https://github.com/CarriedWorldUniverse/casket-dotnet) (.NET).
+Used across the platform for pair-relay channels, at-rest envelope encryption
+(e.g. porter blobs), and deriving named agent identities (`DeriveAgentKey`).
+
+Cross-compatible channel wire format with [casket-ts](https://github.com/CarriedWorldUniverse/casket-ts) (Node.js / Cloudflare Workers) and [casket-dotnet](https://github.com/CarriedWorldUniverse/casket-dotnet) (.NET).
 
 ## License
 
