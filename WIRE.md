@@ -181,6 +181,69 @@ verification failures.
 
 ---
 
+## Multi-recipient format (leading magic `0xCA`)
+
+Age-style hybrid encryption: a fresh random 32-byte DEK seals the body as a
+complete **single-shot envelope** (see above — identical descriptor, body, and
+AAD semantics), and the DEK is wrapped once per recipient via ephemeral-X25519
+ECDH + HKDF + the suite AEAD. Any single recipient private key opens the blob.
+
+```
+blob = MULTIHEADER(4) || WRAPS || BODY
+MULTIHEADER = magic(0xCA) || version(0x01) || suite(1) || count(1)
+WRAPS = count × ( ephemeralPub(32) || keyid(8) || nonce(nonceSize) || wrappedDEK(48) )
+BODY = a complete single-shot envelope sealed under the DEK
+     = DESCRIPTOR(20) || nonce(nonceSize) || ciphertext || tag(16)
+```
+
+Constants:
+
+| Name            | Value  | Notes                                              |
+|-----------------|--------|----------------------------------------------------|
+| magic           | `0xCA` | `multiMagic`; distinct from every suite byte (0x01–0x03), so a multi blob can never be misparsed as a descriptor-first envelope |
+| version         | `0x01` | `multiVersion`; Open rejects any other value        |
+| suite           | same values as the descriptor suite | governs BOTH the DEK-wrap AEAD and the body envelope; the inner descriptor suite MUST equal the header suite (Open enforces) |
+| count           | uint8, `1..255` | `0` is invalid; one wrap entry per recipient, in the order recipients were supplied to seal |
+| ephemeralPub    | 32 bytes | raw X25519 public key, fresh per recipient per seal |
+| keyid           | 8 bytes  | `SHA-256(recipientPub)[:8]`, cleartext recipient identifier |
+| nonce           | suite `nonceSize` (12 / 12 / 24) | random, per wrap entry        |
+| wrappedDEK      | 48 bytes | `AEAD.Seal(DEK)` = ciphertext(32) ‖ tag(16)        |
+| DEK             | 32 bytes | random per seal; the body envelope's key            |
+| recipient keys  | 32 bytes | raw X25519 (private scalar / public key)            |
+
+### Per-recipient DEK wrap
+
+```
+shared  = X25519(ephemeralPriv, recipientPub)
+wrapKey = HKDF-SHA256(secret = shared, salt = empty,
+                      info = "casket-multi-v1" || ephemeralPub || recipientPub) -> 32 bytes
+wrappedDEK = AEAD(suite, wrapKey).Seal(nonce = random, plaintext = DEK, aad = empty)
+```
+
+HKDF info is the exact ASCII bytes `casket-multi-v1` (15 bytes, no NUL)
+followed by the raw 32-byte ephemeral public key, then the raw 32-byte
+recipient public key (79 bytes total). The wrap AEAD uses no AAD; the wrap key
+itself is bound to both ECDH ends via the info string.
+
+### Open rules
+
+- Reject: wrong magic, wrong version, unknown suite, `count == 0`, blob shorter
+  than `4 + count·entrySize + 20` (entrySize = `32 + 8 + nonceSize + 48`).
+- Derive the public key from the supplied private key; `keyid =
+  SHA-256(pub)[:8]`; try matching entries **in order** (truncated-hash
+  collisions between recipients are resolved by trying every matching entry).
+- Unwrap the DEK, then open BODY exactly as a single-shot envelope (same
+  caller-supplied `repoIdentity` / `objectPath` AAD binding), and require the
+  inner descriptor suite to equal the header suite.
+
+The header and wrap entries are **not** separately authenticated: each wrap is
+self-authenticating (AEAD under a key bound to `ephemeralPub` + `recipientPub`),
+and the body authenticates the descriptor + repo identity + object path under
+the DEK. Corrupting a wrap entry only denies that recipient; it cannot alter
+what any recipient decrypts.
+
+---
+
 ## Endianness summary
 
 | Quantity                       | Encoding   |
